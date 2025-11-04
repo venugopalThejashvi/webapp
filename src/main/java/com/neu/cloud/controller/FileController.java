@@ -1,9 +1,7 @@
 package com.neu.cloud.controller;
 
-import com.neu.cloud.repo.FileRepository;
 import com.neu.cloud.response.FileDataResponse;
 import com.neu.cloud.service.S3Service;
-import com.neu.cloud.service.S3ServiceImpl;
 import com.neu.cloud.utils.TimedMetric;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
