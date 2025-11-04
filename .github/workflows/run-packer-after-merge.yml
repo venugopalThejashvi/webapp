@@ -1,0 +1,153 @@
+name: Run Packer After Merge2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-cloud-images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Create env variables file
+        run: |
+          cat > .env << EOF
+          DB_URL="${{ secrets.DB_URL }}"
+          DB_USERNAME="${{ secrets.DB_USERNAME }}"
+          DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+          DB_NAME="${{ secrets.DB_NAME }}"
+          DB_USER="${{ secrets.DB_USER }}"
+          USERNAME="${{ secrets.USERNAME }}"
+          S3_BUCKET="${{ secrets.S3_BUCKET }}"
+          EOF
+
+      - name: Run Tests
+        run: mvn clean install -DskipTests
+
+      - name: Upload JAR as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-app
+          path: target/cloud-0.0.1-SNAPSHOT.jar
+          retention-days: 90
+
+      - name: Install Packer
+        run: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update && sudo apt-get install -y packer
+
+      - name: Configure AWS credentials for Dev account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create variables file
+        run: |
+          cat > variables.pkrvars.hcl << EOF
+          subnet_id = "${{ secrets.SUBNET_ID_DEV }}"
+          instance_type = "t2.micro"
+          aws_region = "${{ secrets.AWS_REGION }}"
+          aws_secret_key = "${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}"
+          aws_access_id = "${{ secrets.AWS_ACCESS_KEY_ID_DEV }}"
+          ami_regions = ["${{ secrets.AWS_REGION }}"]
+          device_name = "/dev/xvda"
+          volume_type = "gp2"
+          ssh_username = "${{ secrets.SSH_USER }}"
+          demo_aws_account_id = "${{ secrets.DEMO_AWS_ACCOUNT_ID }}"
+          EOF
+
+      - name: Initialize Packer plugins
+        run: packer init packer.pkr.hcl
+
+      - name: Format Packer template
+        run: |
+          packer fmt -var-file=variables.pkrvars.hcl packer.pkr.hcl
+          if [ $? -ne 0 ]; then
+            echo "Error: Packer template formatting issues detected. Please run 'packer fmt packer.pkr.hcl' locally to fix."
+            exit 1
+          fi
+
+      - name: Validate Packer template
+        run: packer validate -var-file=variables.pkrvars.hcl packer.pkr.hcl
+
+      - name: Build Packer template
+        id: packer-build
+        run: |
+          packer build -var-file=variables.pkrvars.hcl packer.pkr.hcl | tee packer-output.log
+          AMI_ID=$(grep -o 'ami-[0-9a-f]\{17\}' packer-output.log | tail -1)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+
+      - name: Share AMI with Demo account
+        run: |
+          aws ec2 modify-image-attribute \
+            --image-id ${{ env.AMI_ID }} \
+            --launch-permission "{\"Add\": [{\"UserId\": \"${{ secrets.DEMO_AWS_ACCOUNT_ID }}\"}]}"
+
+      - name: Wait for AMI to be available
+        run: |
+          for i in {1..30}; do
+            STATUS=$(aws ec2 describe-images \
+              --image-ids ${{ env.AMI_ID }} \
+              --query 'Images[0].State' --output text)
+            if [ "$STATUS" = "available" ]; then
+              echo "AMI ${{ env.AMI_ID }} is available"
+              break
+            fi
+            echo "Waiting for AMI to be available (attempt $i/30)..."
+            sleep 10
+            if [ "$i" -eq 30 ]; then
+              echo "Error: AMI not available after 300 seconds"
+              exit 1
+            fi
+          done
+
+      - name: Configure AWS credentials for Demo account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEMO }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEMO }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create new Launch Template version (Demo)
+        run: |
+          aws ec2 create-launch-template-version \
+            --launch-template-id ${{ secrets.LAUNCH_TEMPLATE_ID }} \
+            --source-version "\$Latest" \
+            --launch-template-data "{\"ImageId\":\"${{ env.AMI_ID }}\"}"
+
+      - name: Start Instance Refresh (Demo)
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --preferences '{"InstanceWarmup": 300, "MinHealthyPercentage": 90}' \
+            --strategy "Rolling"
+
+      - name: Wait for Instance Refresh to Complete (Demo)
+        run: |
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+              --query 'InstanceRefreshes[0].Status' --output text)
+            echo "Demo Instance Refresh Status: $STATUS"
+            case "$STATUS" in
+              "Successful"|"Failed"|"Cancelling"|"Cancelled")
+                echo "Demo Instance Refresh completed with status: $STATUS"
+                [ "$STATUS" = "Successful" ] && exit 0 || exit 1
+                ;;
+              *)
+                sleep 30
+                ;;
+            esac
+          done
