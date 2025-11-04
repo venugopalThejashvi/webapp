@@ -1,0 +1,23 @@
+[Unit]
+Description=My Assignment 05
+ConditionPathExists=/opt/csye6225/webapp/.env
+After=network.target
+
+[Service]
+User=csye6225user
+Group=csye6225
+WorkingDirectory=/opt/csye6225/webapp
+
+# Set environment variables here
+Type=simple
+Environment="SPRING_DOTENV_LOCATION=/opt/csye6225/webapp/.env"
+
+ExecStart=/usr/bin/java -jar /opt/csye6225/webapp/cloud-0.0.1-SNAPSHOT.jar
+
+SuccessExitStatus=143
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
